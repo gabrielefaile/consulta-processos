@@ -3,11 +3,12 @@ import requests
 import re
 import pandas as pd
 import unicodedata
+import io
 import time
 from datetime import datetime
 from bs4 import BeautifulSoup
 from openpyxl import Workbook
-from openpyxl.styles import Font, PatternFill
+from openpyxl.styles import Font, PatternFill, Alignment
 
 # =====================================================
 # CONFIGURAÇÕES
@@ -17,10 +18,11 @@ st.set_page_config(page_title="Consulta de Processos - IA", layout="wide")
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0.0.0 Safari/537.36"
+        "AppleWebKit/537.0.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.0.36"
     ),
     "Accept-Language": "pt-BR,pt;q=0.9",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
 
 TRIBUNAIS = {
@@ -37,8 +39,40 @@ TRIBUNAIS = {
     "TJMT": {
         "nome": "TJ Mato Grosso",
         "base_url": "https://consultaprocessual.tjmt.jus.br",
-        "search_url": "https://consultaprocessual.tjmt.jus.br/processos",
+        "consulta_url": "https://consultaprocessual.tjmt.jus.br/",
     },
+}
+
+# Códigos de comarcas principais
+COMARCAS = {
+    "TJSP": {
+        "SAO PAULO": "0100",
+        "SÃO PAULO": "0100",
+        "CAMPINAS": "0300",
+        "RIBEIRAO PRETO": "0506",
+        "RIBEIRÃO PRETO": "0506",
+        "SAO JOSE DO RIO PRETO": "0618",
+        "SÃO JOSÉ DO RIO PRETO": "0618",
+        "SOROCABA": "0670",
+        "SANTOS": "0636",
+        "SAO BERNARDO DO CAMPO": "0640",
+        "SÃO BERNARDO DO CAMPO": "0640",
+    },
+    "TJMS": {
+        "CAMPO GRANDE": "0201",
+        "CORUMBA": "0401",
+        "CORUMBÁ": "0401",
+        "DOURADOS": "0301",
+        "TRES LAGOAS": "0501",
+        "TRÊS LAGOAS": "0501",
+    },
+}
+
+TIPOS_BUSCA = {
+    "Nome da parte": "NMPARTE",
+    "CPF/CNPJ da parte": "DOCPARTE",
+    "OAB do advogado": "NUMOAB",
+    "Número do processo": "NUMPROC",
 }
 
 # =====================================================
@@ -67,26 +101,14 @@ def extrair_ano_processo(numero):
     match = re.search(r"\.(\d{4})\.", numero)
     return int(match.group(1)) if match else None
 
-def identificar_tribunal(numero_processo):
-    numero = numero_processo.replace("-", "").replace(".", "")
-    if len(numero) >= 13:
-        tribunal = numero[13:16]
-        if tribunal == "826":
-            return "TJSP"
-        elif tribunal == "812":
-            return "TJMS"
-        elif tribunal == "811":
-            return "TJMT"
-    return None
+def extrair_foro_processo(numero):
+    match = re.search(r"\.(\d{4})$", numero.replace("-", ""))
+    return match.group(1) if match else ""
 
 # =====================================================
-# FUNÇÃO IA SIMPLES E GRATUITA
+# IA SIMPLES
 # =====================================================
 def ia_analisar_oportunidade(processo):
-    """
-    IA simples sem API: usa regras e heurísticas para classificar
-    o processo como boa oportunidade ou não.
-    """
     motivos = []
     score = 0
 
@@ -96,7 +118,6 @@ def ia_analisar_oportunidade(processo):
     status = processo.get("status", "").upper()
     movimentacao = processo.get("ultima_movimentacao", "").upper()
 
-    # Critérios positivos
     if valor and valor >= 100000:
         score += 30
         motivos.append(f"Valor expressivo: R$ {valor:,.2f}")
@@ -119,7 +140,6 @@ def ia_analisar_oportunidade(processo):
         score += 20
         motivos.append("Existência de garantia/bem penhorado")
 
-    # Critérios negativos
     if any(p in status for p in ["ARQUIVADO", "EXTINTO", "SUSPENSO"]):
         score -= 40
         motivos.append("Processo inativo ou arquivado")
@@ -132,7 +152,6 @@ def ia_analisar_oportunidade(processo):
         score -= 15
         motivos.append("Valor baixo")
 
-    # Classificação
     if score >= 60:
         classificacao = "🟢 ÓTIMA OPORTUNIDADE"
     elif score >= 30:
@@ -158,133 +177,192 @@ def ia_analisar_oportunidade(processo):
     }
 
 # =====================================================
-# SCRAPING TJSP E TJMS
+# SCRAPING E-SAJ (TJSP E TJMS)
 # =====================================================
-def buscar_tjsp_tjms(tribunal, cidade, progress=None, total=1):
-    url = TRIBUNAIS[tribunal]["search_url"]
-    resultados = []
+def buscar_esaj(tribunal, comarca, tipo_busca, termo):
+    base = TRIBUNAIS[tribunal]["base_url"]
+    cd_local = COMARCAS.get(tribunal, {}).get(limpar_texto(comarca).upper())
 
-    foro_map = {
-        "RIBEIRAO PRETO": "0401",
-        "RIBEIRÃO PRETO": "0401",
-        "SAO PAULO": "0100",
-        "SÃO PAULO": "0100",
-        "CAMPINAS": "0300",
-        "CUIABA": "0301",
-        "CUIABÁ": "0301",
-        "CAMPO GRANDE": "0201",
-    }
-
-    foro = foro_map.get(limpar_texto(cidade).upper(), "")
-    if not foro:
+    if not cd_local:
+        st.error(f"Comarca '{comarca}' não cadastrada para {TRIBUNAIS[tribunal]['nome']}.")
         return []
 
+    resultados = []
+    session = requests.Session()
+    session.headers.update(HEADERS)
+
+    # Passo 1: abrir página para criar sessão
+    try:
+        open_resp = session.get(f"{base}/open.do", timeout=20)
+        open_resp.raise_for_status()
+    except requests.RequestException as e:
+        st.error(f"Erro ao conectar no {TRIBUNAIS[tribunal]['nome']}: {e}")
+        return []
+
+    # Passo 2: montar parâmetros de busca
     params = {
         "conversationId": "",
         "paginaConsulta": "1",
-        "localPesquisa.cdLocal": foro,
-        "cbPesquisa": "NUMOAB",
-        "tipoNuProcesso": "UNIFICADO",
-        "foroNumeroUnificado": foro,
-        "dadosConsulta.valorConsulta": cidade,
-        "dadosConsulta.valorConsulta2": "",
+        "dadosConsulta.localPesquisa.cdLocal": cd_local,
+        "cbPesquisa": tipo_busca,
+        "dadosConsulta.tipoNuProcesso": "UNIFICADO",
+        "dadosConsulta.valorConsulta": termo,
     }
 
+    # Se for número do processo, usa parâmetros específicos
+    if tipo_busca == "NUMPROC":
+        params["dadosConsulta.valorConsultaNuUnificado"] = termo
+        params["foroNumeroUnificado"] = extrair_foro_processo(termo)
+        params["dadosConsulta.valorConsulta"] = ""
+
+    # Passo 3: fazer busca
     try:
-        response = requests.get(url, headers=HEADERS, params=params, timeout=20)
-        response.raise_for_status()
-    except requests.RequestException:
+        resp = session.get(f"{base}/search.do", params=params, timeout=30)
+        resp.raise_for_status()
+    except requests.RequestException as e:
+        st.error(f"Erro na busca no {TRIBUNAIS[tribunal]['nome']}: {e}")
         return []
 
-    soup = BeautifulSoup(response.text, "html.parser")
-    processos = soup.find_all("div", class_=re.compile("listagem-dados"))
-
-    for proc in processos:
-        try:
-            numero = proc.find("span", class_="fonteNegrito") or proc.find("a", class_="linkProcesso")
-            numero = numero.get_text(strip=True) if numero else ""
-            partes_div = proc.find_all("td", class_="fonte")
-            partes = [limpar_texto(p.get_text()) for p in partes_div]
-
-            valor_div = proc.find("td", string=re.compile("Valor", re.I))
-            valor_texto = valor_div.find_next_sibling("td").get_text(strip=True) if valor_div else ""
-            valor = normalizar_valor(valor_texto)
-
-            movimentacao = proc.find("div", id=re.compile("movimentacao"))
-            ultima_mov = movimentacao.get_text(strip=True) if movimentacao else ""
-
-            processo = {
-                "tribunal": tribunal,
-                "numero_processo": numero,
-                "partes": " | ".join(partes),
-                "valor": valor,
-                "valor_formatado": f"R$ {valor:,.2f}" if valor else "Não informado",
-                "classe": "",
-                "assunto": "",
-                "status": "Ativo",
-                "ultima_movimentacao": ultima_mov,
-                "ano": extrair_ano_processo(numero),
-                "cidade": cidade,
-                "link": response.url,
-            }
-            processo["ia"] = ia_analisar_oportunidade(processo)
-            resultados.append(processo)
-        except Exception:
-            continue
-
-    return resultados
-
-# =====================================================
-# TJMT (nova consulta processual)
-# =====================================================
-def buscar_tjmt(cidade, progress=None, total=1):
-    url = TRIBUNAIS["TJMT"]["search_url"]
-    resultados = []
-
-    payload = {
-        "pagina": 1,
-        "tamanhoPagina": 50,
-        "tipoConsulta": "parte",
-        "termo": cidade,
-    }
-
-    try:
-        response = requests.post(url, headers=HEADERS, json=payload, timeout=20)
-        response.raise_for_status()
-    except requests.RequestException:
+    # Verifica se houve aviso de "muitos resultados" ou "nenhum"
+    if "não existem informações disponíveis" in resp.text.lower():
         return []
+    if "foram encontrados muitos processos" in resp.text.lower():
+        st.warning("Foram encontrados muitos processos. Refine a busca.")
 
-    try:
-        data = response.json()
-    except ValueError:
-        return []
+    soup = BeautifulSoup(resp.text, "html.parser")
 
-    for item in data.get("processos", []):
-        numero = item.get("numeroProcesso", "")
-        partes = item.get("partes", [])
-        partes_texto = " | ".join([p.get("nome", "") for p in partes if p.get("nome")])
+    # --- tenta achar lista de resultados ---
+    # O e-SAJ pode ter tabela com links de processo
+    links = soup.find_all("a", class_="linkProcesso")
+    if not links:
+        links = soup.select("a[href*='show.do?processo.codigo=']")
+
+    for link in links:
+        numero = limpar_texto(link.get_text())
+        href = link.get("href", "")
+        if href.startswith("/"):
+            href = f"https://{base.split('/')[2]}{href}"
 
         processo = {
-            "tribunal": "TJMT",
+            "tribunal": tribunal,
             "numero_processo": numero,
-            "partes": partes_texto,
-            "valor": normalizar_valor(item.get("valorCausa")),
-            "valor_formatado": item.get("valorCausa", "Não informado"),
-            "classe": item.get("classeProcessual", ""),
-            "assunto": item.get("assunto", ""),
-            "status": item.get("situacao", "Ativo"),
-            "ultima_movimentacao": item.get("ultimaMovimentacao", ""),
-            "ano": extrair_ano_processo(numero),
-            "cidade": cidade,
-            "link": f"https://consultaprocessual.tjmt.jus.br/detalhe/{numero}",
+            "link": href,
         }
-        processo["ia"] = ia_analisar_oportunidade(processo)
         resultados.append(processo)
 
-    return resultados
+    # Se não achou links, tenta extrair da estrutura de listagem
+    if not resultados:
+        processos_div = soup.find_all("div", class_=re.compile("listagem-dados|snippet"))
+        for proc in processos_div:
+            try:
+                numero_tag = (
+                    proc.find("a", class_="linkProcesso") or
+                    proc.find("span", class_="fonteNegrito") or
+                    proc.find("a")
+                )
+                numero = limpar_texto(numero_tag.get_text()) if numero_tag else ""
+                if not numero:
+                    continue
+
+                processo = {
+                    "tribunal": tribunal,
+                    "numero_processo": numero,
+                    "link": TRIBUNAIS[tribunal]["base_url"],
+                }
+                resultados.append(processo)
+            except Exception:
+                continue
+
+    # Para cada resultado, abre página do processo para pegar detalhes
+    processos_completos = []
+    for proc in resultados[:10]:  # limita a 10 para não sobrecarregar
+        detalhes = buscar_detalhes_processo(tribunal, proc["numero_processo"], proc["link"])
+        processos_completos.append(detalhes)
+        time.sleep(0.3)
+
+    return processos_completos
+
+
+def buscar_detalhes_processo(tribunal, numero, link):
+    """Extrai detalhes da página do processo."""
+    processo = {
+        "tribunal": tribunal,
+        "numero_processo": numero,
+        "link": link,
+        "partes": "",
+        "valor": None,
+        "valor_formatado": "Não informado",
+        "classe": "",
+        "assunto": "",
+        "status": "Ativo",
+        "ultima_movimentacao": "",
+        "ano": extrair_ano_processo(numero),
+        "cidade": "",
+    }
+
+    try:
+        resp = requests.get(link, headers=HEADERS, timeout=20)
+        resp.raise_for_status()
+    except Exception:
+        processo["ia"] = ia_analisar_oportunidade(processo)
+        return processo
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+
+    # Classe
+    classe_label = soup.find("span", string=re.compile("Classe", re.I))
+    if classe_label:
+        processo["classe"] = limpar_texto(classe_label.find_next_sibling().get_text()) if classe_label.find_next_sibling() else ""
+
+    # Assunto
+    assunto_label = soup.find("span", string=re.compile("Assunto", re.I))
+    if assunto_label:
+        prox = assunto_label.find_next_sibling()
+        processo["assunto"] = limpar_texto(prox.get_text()) if prox else ""
+
+    # Valor
+    valor_match = re.search(r"Valor da ação.*?\R?\s*([\d\.,]+)", resp.text)
+    if valor_match:
+        processo["valor"] = normalizar_valor(valor_match.group(1))
+        processo["valor_formatado"] = f"R$ {processo['valor']:,.2f}" if processo["valor"] else "Não informado"
+
+    # Status
+    if "Baixado" in resp.text or "Extinto" in resp.text:
+        processo["status"] = "Baixado/Extinto"
+    elif "Arquivado" in resp.text:
+        processo["status"] = "Arquivado"
+    elif "Em tramitação" in resp.text:
+        processo["status"] = "Ativo"
+
+    # Partes
+    partes = []
+    tabelas = soup.find_all("table", class_=re.compile("table|secao"))
+    for tabela in tabelas:
+        for tr in tabela.find_all("tr"):
+            texto = limpar_texto(tr.get_text())
+            if texto and len(texto) > 5:
+                partes.append(texto)
+    processo["partes"] = " | ".join(partes[:5])
+
+    # Última movimentação
+    movs = soup.find_all("tr", class_=re.compile("movimentacao"))
+    if movs:
+        processo["ultima_movimentacao"] = limpar_texto(movs[0].get_text())
+
+    processo["ia"] = ia_analisar_oportunidade(processo)
+    return processo
+
 
 # =====================================================
-# GERAR EXCEL
+# TJMT - link direto (não permite scraping fácil)
+# =====================================================
+def buscar_tjmt(comarca, termo):
+    st.info("TJMT: Consulta automatizada não disponível. Acesse o portal oficial.")
+    return []
+
+
+# =====================================================
+# GERAR EXCEL EM MEMÓRIA
 # =====================================================
 def gerar_excel(processos, cidade):
     df = pd.DataFrame([
@@ -292,7 +370,7 @@ def gerar_excel(processos, cidade):
             "Tribunal": p["tribunal"],
             "Número do Processo": p["numero_processo"],
             "Ano": p["ano"],
-            "Cidade": p["cidade"],
+            "Cidade": p.get("cidade", cidade),
             "Classe": p["classe"],
             "Assunto": p["assunto"],
             "Status": p["status"],
@@ -309,70 +387,57 @@ def gerar_excel(processos, cidade):
         for p in processos
     ])
 
-    nome_arquivo = f"processos_{limpar_texto(cidade).lower().replace(' ', '_')}_{datetime.now().strftime('%d%m%Y')}.xlsx"
-    caminho = f"C:/Users/User/ConsultaProcessos/{nome_arquivo}"
-    df.to_excel(caminho, index=False, engine="openpyxl")
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="Processos")
 
-    # Estilizar
-    wb = Workbook()
-    wb = pd.read_excel(caminho, sheet_name=0)
-    # (Aqui você pode adicionar cores nas colunas depois)
+    return buffer.getvalue(), df
 
-    return caminho, df
 
 # =====================================================
 # INTERFACE STREAMLIT
 # =====================================================
 def main():
     st.title("🤖 Consulta de Processos com IA")
-    st.markdown("Busque processos por cidade nos tribunais **TJSP**, **TJMS** e **TJMT**.")
+    st.markdown("Busque processos por **nome da parte**, **CPF/CNPJ**, **OAB** ou **número do processo**.")
 
     with st.form("form_busca"):
-        col1, col2 = st.columns([3, 1])
+        col1, col2 = st.columns([2, 1])
+
         with col1:
-            cidade = st.text_input("Cidade", placeholder="Ex: Ribeirão Preto")
+            tribunal_opcao = st.selectbox("Tribunal", ["TJSP", "TJMS", "TJMT"])
+
         with col2:
-            st.markdown("<br>", unsafe_allow_html=True)
-            tribunal_opcao = st.selectbox(
-                "Tribunal",
-                ["Todos", "TJSP", "TJMS", "TJMT"]
-            )
+            tipo_busca = st.selectbox("Tipo de busca", list(TIPOS_BUSCA.keys()))
+
+        comarca = st.text_input("Comarca/Cidade", placeholder="Ex: Ribeirão Preto")
+        termo = st.text_input("Termo de busca", placeholder="Ex: nome da parte, CPF, OAB ou nº do processo")
+
         submit = st.form_submit_button("🔍 Buscar Processos")
 
-    if submit and cidade:
-        st.info(f"Buscando processos em **{cidade}**...")
-
-        tribunais_buscar = []
-        if tribunal_opcao == "Todos":
-            tribunais_buscar = ["TJSP", "TJMS", "TJMT"]
-        else:
-            tribunais_buscar = [tribunal_opcao]
-
-        todos_processos = []
-        progresso = st.progress(0)
-        status_text = st.empty()
-
-        for i, tribunal in enumerate(tribunais_buscar):
-            status_text.text(f"Buscando no {TRIBUNAIS[tribunal]['nome']}...")
-            if tribunal == "TJMT":
-                processos = buscar_tjmt(cidade)
-            else:
-                processos = buscar_tjsp_tjms(tribunal, cidade)
-            todos_processos.extend(processos)
-            progresso.progress((i + 1) / len(tribunais_buscar))
-            time.sleep(0.5)
-
-        progresso.empty()
-        status_text.empty()
-
-        if not todos_processos:
-            st.warning("Nenhum processo encontrado. Tente outra cidade ou tribunal.")
+    if submit:
+        if not comarca or not termo:
+            st.warning("Preencha a comarca e o termo de busca.")
             return
 
-        st.success(f"{len(todos_processos)} processo(s) encontrado(s).")
+        st.info(f"Buscando em **{comarca}** no **{TRIBUNAIS[tribunal_opcao]['nome']}**...")
 
-        # Exibir resultados
-        for p in todos_processos:
+        if tribunal_opcao == "TJMT":
+            st.warning(
+                "O TJMT não permite consulta automatizada direta. "
+                f"Clique para consultar manualmente: [{TRIBUNAIS['TJMT']['consulta_url']}]({TRIBUNAIS['TJMT']['consulta_url']})"
+            )
+            return
+
+        processos = buscar_esaj(tribunal_opcao, comarca, TIPOS_BUSCA[tipo_busca], termo)
+
+        if not processos:
+            st.warning("Nenhum processo encontrado. Verifique a comarca e o termo de busca.")
+            return
+
+        st.success(f"{len(processos)} processo(s) encontrado(s).")
+
+        for p in processos:
             with st.expander(f"{p['tribunal']} - {p['numero_processo']} - {p['ia']['classificacao']}"):
                 col1, col2 = st.columns(2)
                 with col1:
@@ -391,16 +456,14 @@ def main():
                 st.write(f"**Recomendação:** {p['ia']['recomendacao']}")
                 st.write(f"**Riscos:** {p['ia']['riscos']}")
 
-        # Gerar Excel
-        caminho, df = gerar_excel(todos_processos, cidade)
+        excel_bytes, df = gerar_excel(processos, comarca)
         st.download_button(
             label="📥 Baixar planilha Excel",
-            data=open(caminho, "rb"),
-            file_name=caminho.split("/")[-1],
+            data=excel_bytes,
+            file_name=f"processos_{limpar_texto(comarca).lower().replace(' ', '_')}_{datetime.now().strftime('%d%m%Y')}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
 
-        st.info(f"Planilha também salva em: `{caminho}`")
 
 if __name__ == "__main__":
     main()
